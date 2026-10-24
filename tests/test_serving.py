@@ -282,6 +282,42 @@ def test_chunked_request(
 
 
 @pytest.mark.dev_server
+def test_body_budget_413_socket_is_still_drained(
+    dev_server: StartDevServer,
+) -> None:
+    """An application-layer body budget frame that rejects a request with
+    413 must not stop the serving layer from draining the socket. The drain
+    is deliberately outside the request body budget stack: it reads the
+    entire oversized request so the client receives a complete 413 response
+    instead of a connection reset.
+    """
+    client = dev_server("body")
+    body = b"a" * (1024 * 1024)  # 1 MiB, far past the app's 1 KiB frame.
+    conn = client.connect()
+    conn.putrequest("POST", "/")
+    conn.putheader("Content-Length", str(len(body)))
+    conn.putheader("Content-Type", "application/octet-stream")
+    conn.endheaders(body)
+
+    with conn.getresponse() as response:
+        assert response.status == 413
+        assert response.read() == b""
+
+    conn.close()
+
+    # The server drained the whole request past the app-layer budget and is
+    # still able to serve a small, in-budget request on a new connection.
+    response = client.request(
+        "/",
+        method="POST",
+        body=b"small",
+        headers={"Content-Type": "application/octet-stream"},
+    )
+    assert response.status == 200
+    assert response.data == b"read 5 bytes"
+
+
+@pytest.mark.dev_server
 def test_multiple_headers_concatenated(standard_app: DevServerClient) -> None:
     """A header key can be sent multiple times. The server will join all
     the values with commas.

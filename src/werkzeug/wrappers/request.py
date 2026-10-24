@@ -7,6 +7,10 @@ import typing as t
 from io import BytesIO
 
 from .._internal import _wsgi_decoding_dance
+from ..body_policy import BodyBudgetError
+from ..body_policy import EffectiveBodyBudget
+from ..body_policy import FormQuotaProfile
+from ..body_policy import resolve_body_budget
 from ..datastructures import CombinedMultiDict
 from ..datastructures import EnvironHeaders
 from ..datastructures import FileStorage
@@ -253,17 +257,48 @@ class Request(_SansIORequest):
 
     def make_form_data_parser(self) -> FormDataParser:
         """Creates the form data parser. Instantiates the
-        :attr:`form_data_parser_class` with some parameters.
+        :attr:`form_data_parser_class` with the effective limits from the
+        request body budget stack folded onto this request's ``max_*``
+        attributes.
+
+        .. versionchanged:: 3.2
+            The parser is configured with the resolved body budget, including
+            the effective ``form_quota_profile``.
 
         .. versionadded:: 0.8
         """
+        budget = self._effective_body_budget()
         return self.form_data_parser_class(
             stream_factory=self._get_file_stream,
-            max_form_memory_size=self.max_form_memory_size,
-            max_content_length=self.max_content_length,
-            max_form_parts=self.max_form_parts,
+            max_form_memory_size=budget.max_form_memory_size,
+            max_content_length=budget.max_content_length,
+            max_form_parts=budget.max_form_parts,
             cls=self.parameter_storage_class,
+            form_quota_profile=budget.form_quota_profile,
         )
+
+    def _effective_body_budget(self) -> EffectiveBodyBudget:
+        """Resolve the active body budget stack onto this request's class or
+        instance ``max_*`` attributes and return the effective view."""
+
+        return resolve_body_budget(
+            max_content_length=self.max_content_length,
+            max_form_memory_size=self.max_form_memory_size,
+            max_form_parts=self.max_form_parts,
+        )
+
+    @property
+    def body_budget(self) -> EffectiveBodyBudget:
+        """The effective request body budget for this request: the active
+        stack frames (see :mod:`werkzeug.body_policy`) folded onto this
+        request's class or instance ``max_*`` attributes. With no frames
+        pushed this is exactly the static ``max_*`` configuration with the
+        historical stream gate and form quota profile.
+
+        .. versionadded:: 3.2
+        """
+
+        return self._effective_body_budget()
 
     def _load_form_data(self) -> None:
         """Method used internally to retrieve submitted data.  After calling
@@ -278,17 +313,28 @@ class Request(_SansIORequest):
         if "form" in self.__dict__:
             return
 
+        budget = self._effective_body_budget()
+        # Accessing the parsing stream first preserves the historical
+        # RuntimeError for shallow requests regardless of the active profile.
+        parsing_stream = self._get_stream_for_parsing()
+
+        if budget.form_quota_profile is FormQuotaProfile.OPAQUE_BODY:
+            raise BodyBudgetError(
+                "Form parsing is disabled by the active 'opaque_body' body"
+                " budget frame. Use get_data or get_json to read the body."
+            )
+
         if self.want_form_data_parsed:
             parser = self.make_form_data_parser()
             data = parser.parse(
-                self._get_stream_for_parsing(),
+                parsing_stream,
                 self.mimetype,
                 self.content_length,
                 self.mimetype_params,
             )
         else:
             data = (
-                self.stream,
+                parsing_stream,
                 self.parameter_storage_class(),
                 self.parameter_storage_class(),
             )
@@ -297,6 +343,10 @@ class Request(_SansIORequest):
         # our cached_property non-data descriptor.
         d = self.__dict__
         d["stream"], d["form"], d["files"] = data
+        d["_stream_budget_id"] = (
+            budget.max_content_length,
+            budget.stream_gate,
+        )
 
     def _get_stream_for_parsing(self) -> t.IO[bytes]:
         """This is the same as accessing :attr:`stream` with the difference
@@ -327,7 +377,7 @@ class Request(_SansIORequest):
     def __exit__(self, exc_type, exc_value, tb) -> None:  # type: ignore
         self.close()
 
-    @cached_property
+    @property
     def stream(self) -> t.IO[bytes]:
         """The WSGI input stream, with safety checks. This stream can only be consumed
         once.
@@ -347,6 +397,22 @@ class Request(_SansIORequest):
         stream cannot be read safely. Depending on how the server handles this, clients
         may show a "connection reset" failure instead of seeing the 413 response.
 
+        The stream is built from the :attr:`body_budget` effective view (merged
+        stream gate and length budget) on first access. The guarded stream
+        object is cached together with the identity of that effective view.
+        If a frame is pushed or popped while the request is alive and the
+        effective ``(max_content_length, stream_gate)`` changes, the cached
+        stream is discarded and rebuilt on the next access; the limits of the
+        frame under which the first stream was built are never silently
+        retained. The rebuilt stream wraps ``wsgi.input`` at its current
+        position, so partially consumed input continues under the outer
+        budget. A reference obtained earlier keeps reading the object it was
+        given.
+
+        .. versionchanged:: 3.2
+            Resolve the active body budget stack and invalidate the cached
+            guarded stream when the effective gate or length budget changes.
+
         .. versionchanged:: 2.3
             Check ``max_content_length`` preemptively and while reading.
 
@@ -360,9 +426,36 @@ class Request(_SansIORequest):
                 " from the input stream is disabled."
             )
 
-        return get_input_stream(
-            self.environ, max_content_length=self.max_content_length
+        budget = self._effective_body_budget()
+        identity = (budget.max_content_length, budget.stream_gate)
+        d = self.__dict__
+
+        if d.get("stream") is not None and d.get("_stream_budget_id") == identity:
+            return t.cast(t.IO[bytes], d["stream"])
+
+        stream = get_input_stream(
+            self.environ,
+            max_content_length=budget.max_content_length,
+            stream_gate=budget.stream_gate,
         )
+        d["stream"] = stream
+        d["_stream_budget_id"] = identity
+        return stream
+
+    @stream.setter
+    def stream(self, value: t.IO[bytes]) -> None:
+        budget = self._effective_body_budget()
+        d = self.__dict__
+        d["stream"] = value
+        d["_stream_budget_id"] = (
+            budget.max_content_length,
+            budget.stream_gate,
+        )
+
+    @stream.deleter
+    def stream(self) -> None:
+        self.__dict__.pop("stream", None)
+        self.__dict__.pop("_stream_budget_id", None)
 
     input_stream = environ_property[t.IO[bytes]](
         "wsgi.input",
@@ -430,7 +523,13 @@ class Request(_SansIORequest):
         rv = getattr(self, "_cached_data", None)
         if rv is None:
             if parse_form_data:
-                self._load_form_data()
+                # The 'opaque_body' quota profile only allows whole-body
+                # reads; never enter the form parsing entry point from here.
+                if (
+                    self._effective_body_budget().form_quota_profile
+                    is not FormQuotaProfile.OPAQUE_BODY
+                ):
+                    self._load_form_data()
             rv = self.stream.read()
             if cache:
                 self._cached_data = rv

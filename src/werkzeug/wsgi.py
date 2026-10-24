@@ -5,6 +5,7 @@ import typing as t
 from functools import partial
 from functools import update_wrapper
 
+from .body_policy import StreamGate
 from .exceptions import ClientDisconnected
 from .exceptions import RequestEntityTooLarge
 from .sansio import utils as _sansio_utils
@@ -144,6 +145,8 @@ def get_input_stream(
     environ: WSGIEnvironment,
     safe_fallback: bool = True,
     max_content_length: int | None = None,
+    *,
+    stream_gate: StreamGate | None = None,
 ) -> t.IO[bytes]:
     """Return the WSGI input stream, wrapped so that it may be read safely
     without going past the ``Content-Length`` header value or
@@ -171,6 +174,14 @@ def get_input_stream(
         Disabling this allows infinite streams, which can be a denial-of-service risk.
     :param max_content_length: The maximum length that content-length or streaming
         requests may not exceed.
+    :param stream_gate: The active :class:`~werkzeug.body_policy.StreamGate`.
+        ``None`` (the default) is equivalent to :attr:`StreamGate.TERMINATED`,
+        the historical behavior. Other gates change only how length-unknown
+        (streaming) requests are read; requests with a ``Content-Length`` are
+        always bounded by it.
+
+    .. versionchanged:: 3.2
+        Added the ``stream_gate`` parameter for the request body budget stack.
 
     .. versionchanged:: 2.3.2
         ``max_content_length`` is only applied to streaming requests if the server sets
@@ -181,6 +192,9 @@ def get_input_stream(
 
     .. versionadded:: 0.9
     """
+    if stream_gate is None:
+        stream_gate = StreamGate.TERMINATED
+
     stream = t.cast(t.IO[bytes], environ["wsgi.input"])
     content_length = get_content_length(environ)
 
@@ -190,7 +204,11 @@ def get_input_stream(
 
     # A WSGI server can set this to indicate that it terminates the input stream. In
     # that case the stream is safe without wrapping, or can enforce a max length.
-    if "wsgi.input_terminated" in environ:
+    #
+    # The TERMINATED gate trusts this marker for length-unknown requests, which is
+    # the historical behavior. It is checked before the Content-Length branch so the
+    # (rare) combination of a marker and a Content-Length behaves exactly as before.
+    if stream_gate is StreamGate.TERMINATED and "wsgi.input_terminated" in environ:
         if max_content_length is not None:
             # If this is moved above, it can cause the stream to hang if a read attempt
             # is made when the client sends no data. For example, the development server
@@ -201,10 +219,25 @@ def get_input_stream(
 
         return stream
 
-    # No limit given, return an empty stream unless the user explicitly allows the
-    # potentially infinite stream. An infinite stream is dangerous if it's not expected,
-    # as it can tie up a worker indefinitely.
     if content_length is None:
+        # No Content-Length advertises the body size.
+        if stream_gate is StreamGate.EMPTY_IF_UNKNOWN:
+            # Never read a length-unknown body, even if the server claims to
+            # terminate the stream.
+            return io.BytesIO()
+
+        if (
+            stream_gate is StreamGate.CONTENT_LENGTH
+            and "wsgi.input_terminated" in environ
+        ):
+            # The budget is enforced through Content-Length only. The server still
+            # guarantees termination, so the stream cannot be infinite, but no
+            # read-time max_content_length wrapping is applied to it.
+            return stream
+
+        # No limit given, return an empty stream unless the user explicitly allows the
+        # potentially infinite stream. An infinite stream is dangerous if it's not
+        # expected, as it can tie up a worker indefinitely.
         return io.BytesIO() if safe_fallback else stream
 
     return t.cast(t.IO[bytes], LimitedStream(stream, content_length))

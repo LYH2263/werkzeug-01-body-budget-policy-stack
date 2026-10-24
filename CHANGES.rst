@@ -1,5 +1,22 @@
 .. currentmodule:: werkzeug
 
+Version 3.2
+-----------
+
+Unreleased
+
+-   Add the request body budget policy stack (:mod:`werkzeug.body_policy`).
+    ``BodyBudgetFrame`` frames can be pushed and popped (or used with the
+    ``body_budget`` context manager) to temporarily tighten or replace the
+    effective ``max_content_length``, ``max_form_memory_size`` and
+    ``max_form_parts`` budgets, with ``strict_min``, ``active_frame`` and
+    ``inherit_only`` merge modes, ``content_length``, ``terminated`` and
+    ``empty_if_unknown`` stream gates, and ``multipart_triple``,
+    ``urlencoded_content_only`` and ``opaque_body`` form quota profiles. The
+    stack is stored in a context variable, so concurrent requests do not
+    share frames, and an empty stack preserves the previous behavior.
+
+
 Version 3.1.9
 -------------
 

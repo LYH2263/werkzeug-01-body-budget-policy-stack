@@ -5,6 +5,9 @@ from io import BytesIO
 from urllib.parse import parse_qsl
 
 from ._internal import _plain_int
+from .body_policy import BodyBudgetError
+from .body_policy import FormQuotaProfile
+from .body_policy import resolve_body_budget
 from .datastructures import FileStorage
 from .datastructures import Headers
 from .datastructures import MultiDict
@@ -109,6 +112,11 @@ def parse_form_data(
     :param silent: If set to False parsing errors will not be caught.
     :return: A tuple in the form ``(stream, form, files)``.
 
+    .. versionchanged:: 3.2
+        The active request body budget stack
+        (:mod:`werkzeug.body_policy`) is resolved on top of the arguments
+        passed here, including its stream gate and form quota profile.
+
     .. versionchanged:: 3.1.9
         ``max_form_memory_size`` is not applied to
         ``application/x-www-form-urlencoded``.
@@ -162,6 +170,15 @@ class FormDataParser:
     :param cls: an optional dict class to use.  If this is not specified
                        or `None` the default :class:`MultiDict` is used.
     :param silent: If set to False parsing errors will not be caught.
+    :param form_quota_profile: Which form parsing entry points and limits are
+        active. Defaults to :attr:`FormQuotaProfile.MULTIPART_TRIPLE`, the
+        historical behavior. The request body budget stack can override this
+        per frame.
+
+    .. versionchanged:: 3.2
+        Added the ``form_quota_profile`` parameter. :meth:`parse_from_environ`
+        now resolves the active request body budget stack instead of using
+        only the parser's configured limits.
 
     .. versionchanged:: 3.0
         The ``charset`` and ``errors`` parameters were removed.
@@ -184,6 +201,7 @@ class FormDataParser:
         silent: bool = True,
         *,
         max_form_parts: int | None = None,
+        form_quota_profile: FormQuotaProfile = FormQuotaProfile.MULTIPART_TRIPLE,
     ) -> None:
         if stream_factory is None:
             stream_factory = default_stream_factory
@@ -198,21 +216,40 @@ class FormDataParser:
 
         self.cls = cls
         self.silent = silent
+        self.form_quota_profile = form_quota_profile
 
     def parse_from_environ(self, environ: WSGIEnvironment) -> t_parse_result:
         """Parses the information from the environment as form data.
 
+        The effective limits, stream gate, and form quota profile are
+        resolved from the parser's configuration and the current request
+        body budget stack for this execution context. The stack is read
+        directly here, so unlike constructing another request this bypass
+        never loses an active frame.
+
         :param environ: the WSGI environment to be used for parsing.
         :return: A tuple in the form ``(stream, form, files)``.
         """
-        stream = get_input_stream(environ, max_content_length=self.max_content_length)
+        effective = resolve_body_budget(
+            max_content_length=self.max_content_length,
+            max_form_memory_size=self.max_form_memory_size,
+            max_form_parts=self.max_form_parts,
+        )
+        stream = get_input_stream(
+            environ,
+            max_content_length=effective.max_content_length,
+            stream_gate=effective.stream_gate,
+        )
         content_length = get_content_length(environ)
         mimetype, options = parse_options_header(environ.get("CONTENT_TYPE"))
-        return self.parse(
+        return self._run_parse(
             stream,
-            content_length=content_length,
-            mimetype=mimetype,
-            options=options,
+            mimetype,
+            content_length,
+            options,
+            profile=effective.form_quota_profile,
+            max_form_memory_size=effective.max_form_memory_size,
+            max_form_parts=effective.max_form_parts,
         )
 
     def parse(
@@ -224,6 +261,12 @@ class FormDataParser:
     ) -> t_parse_result:
         """Parses the information from the given stream, mimetype,
         content length and mimetype parameters.
+
+        The stream must already be limited according to the effective
+        ``max_content_length`` (use :meth:`.get_input_stream`). Parsing uses
+        this parser's configured limits and :attr:`form_quota_profile`; when
+        a :class:`~werkzeug.wrappers.Request` creates this parser those
+        already reflect its active body budget stack.
 
         :param stream: A limited input stream, from :meth:`.get_input_stream`.
         :param mimetype: The mimetype used to choose how to parse the form.
@@ -238,18 +281,60 @@ class FormDataParser:
             The invalid ``application/x-url-encoded`` content type is not
             treated as ``application/x-www-form-urlencoded``.
         """
+        return self._run_parse(
+            stream,
+            mimetype,
+            content_length,
+            options,
+            profile=self.form_quota_profile,
+            max_form_memory_size=self.max_form_memory_size,
+            max_form_parts=self.max_form_parts,
+        )
+
+    def _run_parse(
+        self,
+        stream: t.IO[bytes],
+        mimetype: str,
+        content_length: int | None,
+        options: dict[str, str] | None,
+        *,
+        profile: FormQuotaProfile,
+        max_form_memory_size: int | None,
+        max_form_parts: int | None,
+    ) -> t_parse_result:
+        if profile is FormQuotaProfile.OPAQUE_BODY:
+            raise BodyBudgetError(
+                "Form parsing is disabled by the active 'opaque_body' body"
+                " budget frame. Only whole-body reads (get_data/get_json) are"
+                " allowed."
+            )
+
+        parse_func: t.Callable[[], t_parse_result]
+
         if mimetype == "multipart/form-data":
-            parse_func = self._parse_multipart
+            if profile is FormQuotaProfile.MULTIPART_TRIPLE:
+                parse_func = lambda: self._parse_multipart(  # noqa: E731
+                    stream,
+                    mimetype,
+                    content_length,
+                    options or {},
+                    max_form_memory_size=max_form_memory_size,
+                    max_form_parts=max_form_parts,
+                )
+            else:
+                # URLENCODED_CONTENT_ONLY: multipart is not parsed through the
+                # form entry, the stream passes through and the multipart
+                # memory/parts limits must not be applied.
+                return stream, self.cls(), self.cls()
         elif mimetype == "application/x-www-form-urlencoded":
-            parse_func = self._parse_urlencoded
+            parse_func = lambda: self._parse_urlencoded(  # noqa: E731
+                stream, mimetype, content_length, options or {}
+            )
         else:
             return stream, self.cls(), self.cls()
 
-        if options is None:
-            options = {}
-
         try:
-            return parse_func(stream, mimetype, content_length, options)
+            return parse_func()
         except ValueError:
             if not self.silent:
                 raise
@@ -262,11 +347,14 @@ class FormDataParser:
         mimetype: str,
         content_length: int | None,
         options: dict[str, str],
+        *,
+        max_form_memory_size: int | None,
+        max_form_parts: int | None,
     ) -> t_parse_result:
         parser = MultiPartParser(
             stream_factory=self.stream_factory,
-            max_form_memory_size=self.max_form_memory_size,
-            max_form_parts=self.max_form_parts,
+            max_form_memory_size=max_form_memory_size,
+            max_form_parts=max_form_parts,
             cls=self.cls,
         )
         boundary = options.get("boundary", "").encode("ascii")
